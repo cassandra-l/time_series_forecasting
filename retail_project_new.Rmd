@@ -1,0 +1,307 @@
+---
+title: "Retail project"
+author: "Cassandra Lee"
+date: "2025-03-03"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Read required packages
+```{r setup, include=FALSE}
+library(readabs)
+library(tidyr)
+library(stringr)
+library(fpp3)
+library(urca)
+```
+
+
+## Read the data from ABS website 
+```{r}
+retail_raw <- read_abs("8501.0", tables = 11)
+```
+
+## Data cleaning and exploration
+```{r}
+# Filter data to include only monthly turnover records for states and industries
+library(dplyr)
+filtered_data <- retail_raw %>%
+  filter((startsWith(series, "Turnover ;  New South Wales ; ") |
+         startsWith(series, "Turnover ;  Victoria ; ") |
+         startsWith(series, "Turnover ;  Queensland ; ") |
+         startsWith(series, "Turnover ;  South Australia ; ") |
+         startsWith(series, "Turnover ;  Western Australia ; ") |
+         startsWith(series, "Turnover ;  Tasmania ; ") |
+         startsWith(series, "Turnover ;  Northern Territory ; ") |
+         startsWith(series, "Turnover ;  Australian Capital Territory ; ")) &
+         !grepl("Total \\(Industry\\)", series))
+  
+unique(filtered_data$series)
+filtered_data
+```
+
+```{r}
+filtered_data <- filtered_data %>%
+  separate(series, into = c("category", "state", "industry"), sep = " ; ") %>%
+  mutate(across(everything(), trimws),  # Trim whitespace from all columns
+         industry = str_remove_all(industry, " ;$"))  # Remove trailing semicolon if present
+
+# Prepare retail data for analysis
+retail_data <- filtered_data %>%
+  select(state, industry, series_id, date, value) %>%   # Keep only relevant columns
+  rename(turnover = value) %>%     # Rename 'value' to 'turnover' for clarity
+  mutate(month = yearmonth(date)) %>% # Convert 'date' to year-month format
+  mutate(turnover = as.numeric(turnover)) %>% # Ensure 'turnover' is numeric
+  select (-date) # Remove the original 'date' column
+```
+
+```{r}
+# Remove discontinued series
+retail_data <- retail_data %>%
+  group_by(series_id) %>%
+  filter(!any(is.na(turnover))) %>%
+  ungroup()
+```
+
+```{r}
+# Select a series at random
+set.seed(1)
+
+my_series <- retail_data %>% filter(series_id == sample(series_id, 1))
+my_series <- my_series %>%
+  as_tsibble(index = month, key = c(state, industry))
+my_series
+```
+
+The graph shows a clear upward trend in retail turnover over time, meaning sales are increasing steadily.There are noticeable dips, particularly around early 2020, likely due to the COVID-19 pandemic. There are also visible fluctuations, which some peaks and troughs suggest a seasonal component. The variance of the graph increases over time, indicating heteroskedasticity.
+
+## Data visualisation
+```{r}
+library(fpp3)
+my_series %>% 
+  autoplot(turnover) +
+  labs(title = "Monthly retail turnover of food retailing in New South Wales", 
+       y = "Retail turnover (in $Million AUD)") 
+
+my_series %>% 
+  gg_subseries(turnover) +
+  labs(title = "Monthly retail turnover of food retailing in New South Wales", 
+       y = "Retail turnover (in $Million AUD)") 
+
+my_series %>% 
+  gg_season(turnover) +
+  labs(title = "Monthly retail turnover of food retailing in New South Wales", y = "Retail turnover (in $Million AUD)") 
+
+my_series %>% 
+  ACF(turnover) %>%
+  autoplot()
+```
+
+## Data transformation
+```{r}
+# Obtain the optimal value 
+lambda_value <- my_series %>% 
+  features(turnover, features = lst(guerrero)) %>%
+  pull(guerrero_lambda_guerrero)
+
+# Visualize tarnsformed data 
+my_series %>%
+  autoplot(box_cox(turnover, lambda = lambda_value)) +
+  labs(title = "Monthly retail turnover of food retailing in New South Wales", 
+       y = "Retail turnover (in $Million AUD)")
+
+# Unit-root test to check if data is stationary
+# p-vaue = 0.01, data is not stationary, diffrencing is needed
+my_series %>%
+  features(box_cox(turnover, lambda = lambda_value), unitroot_kpss)
+
+# Check if seasonal differencing is needed
+# 1 seasonal differencing is needed
+my_series %>%
+  features(box_cox(turnover, lambda = lambda_value), unitroot_nsdiffs)
+
+# Apply seasonal differencing and check if any non-seasonal differencing is needed
+# 1 non-seasonal differencing is needed
+my_series %>%
+  features(difference(box_cox(turnover, lambda = lambda_value), 12) , unitroot_ndiffs)
+
+# Check if data is stationary after differencing
+# p-value = 0.1, which > 0.05. data is now stationary
+my_series %>% 
+  features(difference(difference(box_cox(turnover, lambda = lambda_value),12), 1), unitroot_kpss)
+```
+
+## ETS model
+According to the time plot, there is trend and seasonality in our data. Hence, ETS model with no trend or no seasonality will not be in our consideration. Moreover, the trend does not flatten over time, hence we exclude damped trend ETS model as well. In addition, multiplicative trend will also not be in our consideration as it will not produce a good forecast. Besides, ETS(A,N,M), ETS(A,A,M) and ETS(A,Ad,M) can lead to numerical difficulties. By applying these restrictions, possible ETS models will be ETS(A,A,A), ETS(M,A,A) and ETS(M,A,M).
+
+Based on RMSE and AICc value, the best model is ETS(M,A,M) model.
+```{r}
+# Split data into training and test data set
+train <- my_series %>%
+  slice(1:(n()-24))
+train
+
+test <- my_series %>%
+  slice((n()-23):n())
+test
+
+# Fit ETS models
+list_ETS <- train %>%
+  model(
+    auto_ets = ETS(turnover),
+    AAA = ETS(turnover~error("A") + trend("A") + season("A")),
+    MAA = ETS(turnover~error("M") + trend("A") + season("A")),
+    MAM = ETS(turnover~error("M") + trend("A") + season("M")))
+
+# Evaluate ETS model performance 
+list_ETS %>% glance()
+
+# Assess ETS Model Forecast Accuracy
+list_ETS %>%
+  forecast(h = "2 years") %>%
+  accuracy(test)
+```
+# ARIMA model
+From the PACF plot, we can see that there is a significant spike at lag 12 and lag (24). Hence, we can consider our P to be 2. To determine p, we will only look at the spikes within the first seasonal lag, which is before lag 12. We can noticed that there is two very significant spikes. Thus, we can consider our p to be 2, which gives us AR(2).
+
+From the ACF plot, we can see a significant spike at lag 12 and lag 24. Hence, we can consider Q to be 1 or 2. As for our q, since there is a significant spike at lag 1, we can consider q to be 1.
+
+Moreover, since we already performed two differencing previously, the constant for the models should be 0 to avoid the long term forecast to follow a quadratic trend. When c=0, d=2, the long term forecast will follow a straight line, which align with our data since our data shows an upward trend.
+
+This gives us a shortlist of ARIMA model:
+ARIMA(2,1,1)(2,1,1) [12] 
+ARIMA(2,1,1)(2,1,2) [12] 
+
+Based on AICc and RMSE, the best model is ARIMA(2,1,1)(2,1,1) [12] 
+```{r}
+# Plot PACF plot
+my_series %>% 
+  gg_tsdisplay(difference(difference(box_cox(turnover, lambda = lambda_value),12), 1),plot_type = "partial")
+
+# FIT ARIMA model
+list_ARIMA <- train %>% 
+  model(
+    auto_arima = ARIMA(box_cox(turnover, lambda = lambda_value)),
+    arima210111 = ARIMA(box_cox(turnover, lambda = lambda_value) ~ 0+pdq(2,1,1) +PDQ(2,1,1)),
+    arima211111 = ARIMA(box_cox(turnover, lambda = lambda_value) ~ 0+pdq(2,1,1) +PDQ(2,1,2)))
+
+# Evaluate ARIMA model performance 
+list_ARIMA %>% 
+  glance()
+
+# Assess ARIMA Model Forecast Accuracy
+list_ARIMA %>% 
+  forecast(h = "2 years") %>% 
+  accuracy(test)
+```
+
+
+## Perform parameter estimates
+This show how much influence the past values, trend, and seasonal components have on the predictions. These estimates are essential to understanding the structure of the model and how well it fits the data.
+
+The ARIMA model appears to be a better fit based on AIC and BIC, but diagnostic checking (ACF and Ljung-Box) is necessary to confirm whether either model suffers from significant residual autocorrelation. The choice between the models should be based on their forecasting performance as well as their residual diagnostics.
+```{r}
+fit <- train %>% 
+  model(MAM =  ETS(turnover~error("M") + trend("A") + season("M")), 
+        arima211111 = ARIMA(box_cox(turnover, lambda = lambda_value) ~ 0+pdq(2,1,1) +PDQ(2,1,1)))
+
+# ETS model:  parameter estimate
+fit %>% 
+  select(MAM) %>%
+  report()
+
+# ARIMA model: parameter estimate
+fit %>%
+  select(arima211111) %>%
+  report() 
+```
+
+## ETS model prediction and evaluation
+From the residual plots, we observe that the mean of the residuals is approximately zero, and the variance appears to be relatively stable over time, with a noticeable spike around 2020. This suggests that for most of the period, the model captures the overall trend well, but there may be an anomaly or structural change around that time.
+
+The autocorrelation function (ACF) plot shows that most lags fall within the blue confidence bands, indicating that the residuals are mostly uncorrelated. However, a few spikes suggest some lingering autocorrelation, implying that the model may not have captured all the patterns in the data.
+
+The histogram of residuals shows a roughly symmetric distribution centered around zero, supporting the assumption of normally distributed errors. However, there are some extreme residual values, which may indicate occasional outliers.
+
+To formally assess whether the residuals resemble white noise, a Ljung-Box test is performed. The p-value for the test is 0, which is lower than 0.05. Hence, null hypothesis which indicates the residuals are not distinguishable from a white noise series is rejected. This suggests the residuals do not resembles white noise.
+```{r}
+# ETS model: forecast 
+train %>% 
+  model(MAM =  ETS(turnover ~ error('M')+trend('A')+season('M')))%>% 
+  forecast(h = '2 years') %>% 
+  autoplot(slice_tail(my_series, n = 4*8)) +
+  ggtitle("Two years forecasting (ETS models) of New South Wales food retailing turnover") + ylab("Million $AUD")
+
+# ETS model: prediction interval
+ETS_PI <- train %>% 
+  model(MAM =  ETS(turnover ~ error('M')+trend('A')+season('M')))%>% 
+  forecast(h = '2 years') %>%
+  hilo()
+ETS_PI
+
+# ETS model :Residuals diagnostic
+fit %>% 
+  select(MAM) %>% 
+  gg_tsresiduals()
+
+# ETS model: Ljung-box test
+# to test for autocorrelation remaining in the residuals after fitting a model to a time series.
+fit %>% 
+  select(MAM) %>% 
+  augment() %>% 
+  features(.innov, ljung_box, lag = 24, dof = 16)
+```
+
+## ARIMA model prediction and evaluation
+The residuals from the ARIMA model exhibit a mean close to zero and stable variance, similar to the ETS model. A noticeable spike around 2020 is also present, suggesting a potential anomaly or structural change.
+
+The ACF plot shows that most residuals remain within the confidence bands, indicating little autocorrelation, much like in the ETS model. However, compared to ETS, there are fewer significant spikes, suggesting that ARIMA may have captured more of the underlying structure.
+
+The histogram of residuals maintains a roughly symmetric shape centered around zero, though it appears to have slightly fewer extreme values than the ETS model, indicating fewer large deviations.
+
+A Ljung-Box test again returns a p-value of 0, rejecting the null hypothesis that residuals are white noise. This suggests that, like ETS, the ARIMA model does not fully eliminate patterns in the data, though its performance in reducing autocorrelation appears slightly improved.
+```{r}
+train %>% 
+  model(arima211111 = ARIMA(box_cox(turnover, lambda = lambda_value) ~ 0+pdq(2,1,1) +PDQ(2,1,1)))%>% 
+  forecast(h = '2 years') %>% 
+  autoplot(slice_tail(my_series, n = 4*8)) +
+  ggtitle("two years forecasting (ARIMA models) of New South Wales food retailing turnover") + ylab("Million $AUD")
+
+# ARIMA model: prediction interval
+ARIMA_PI <- train %>% 
+  model(arima211111 = ARIMA(box_cox(turnover, lambda = lambda_value) ~ 0+pdq(2,1,1) +PDQ(2,1,1)))%>% 
+  forecast(h = '2 years') %>% 
+  hilo()
+ARIMA_PI
+
+# ARIMA model :Residuals diagnostic
+fit %>% 
+  select(arima211111) %>% 
+  gg_tsresiduals()
+
+# ARIMA model: Ljung-box test
+fit %>% 
+  select(arima211111) %>% 
+  augment() %>% 
+  features(.innov, ljung_box, lag = 24, dof = 6)
+```
+
+## Summary of ETS and ARIMA model evaluation
+The results above indicate the presence of autocorrelation in the residuals of both the ARIMA and ETS models. This suggests that other models may better capture the underlying patterns in the dataset. When comparing the two chosen models, neither fully meets the properties of a good forecasting model.
+
+## Comparison of forecast results: ETS vs ARIMA
+From the forecast plot, we observe that the ETS model provides a better fit to the original data. This conclusion is further supported by the RMSE values, where the ETS model has a significantly lower RMSE than the ARIMA model, indicating better predictive accuracy.
+```{r}
+fit %>% 
+  forecast(h = "2 years") %>% 
+   accuracy(test)
+
+fit %>% 
+  forecast(h = "2 years") %>% 
+  autoplot(test) +
+  labs(title = "Forecast for monthly food retailing turnover in New South Wales", 
+       y = "Retail turnover (in $Million AUD)")
+```
+
+
